@@ -1,0 +1,730 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>PDF Reader with Voice</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; font-family: system-ui, sans-serif; background:#1e1e1e; color:#eee; display:flex; flex-direction:column; height:100vh; }
+  #toolbar { padding:8px 12px; background:#2a2a2a; display:flex; gap:10px; align-items:center; flex-wrap:wrap; border-bottom:1px solid #444; }
+  #toolbar button, #toolbar select, #toolbar input[type=file] { background:#3a3a3a; color:#eee; border:1px solid #555; padding:6px 10px; border-radius:4px; font-size:13px; cursor:pointer; }
+  #toolbar button:hover:not(:disabled) { background:#4a4a4a; }
+  #toolbar button:disabled { opacity:.35; cursor:not-allowed; }
+  #toolbar label { font-size:13px; display:flex; align-items:center; gap:6px; }
+  #status { font-size:12px; opacity:.85; margin-left:auto; max-width:40%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #engineBadge { font-size:11px; padding:2px 6px; border-radius:3px; background:#444; }
+  #engineBadge.piper { background:#2d5a2d; color:#cfe8cf; }
+  #viewer { flex:1; overflow:auto; padding:20px; display:flex; flex-direction:column; align-items:center; gap:20px; }
+  .page { position:relative; box-shadow:0 4px 14px rgba(0,0,0,.55); background:#fff; }
+  .page canvas { display:block; }
+  .word-layer { position:absolute; inset:0; }
+  .word { position:absolute; color:transparent; white-space:pre; cursor:pointer; transform-origin: 0 0; line-height:1; user-select:none; }
+  .word:hover { outline:1px dashed rgba(255,255,255,.4); }
+  .word.current { background: rgba(255,210,0,0.55); border-radius:2px; box-shadow:0 0 0 1px rgba(255,180,0,.6); }
+  .word.spoken { background: rgba(120,180,255,0.18); border-radius:2px; }
+  #help { font-size:12px; opacity:.7; padding:6px 12px; background:#252525; border-top:1px solid #333; }
+  #empty { color:#888; padding:60px; text-align:center; }
+  #empty h1 { margin:0 0 12px 0; font-weight:400; }
+</style>
+</head>
+<body>
+<div id="toolbar">
+  <input type="file" id="file" accept="application/pdf">
+  <button id="play" disabled>&#9654; Play</button>
+  <button id="pause" disabled>&#10073;&#10073; Pause</button>
+  <button id="stop" disabled>&#9632; Stop</button>
+  <label>Engine
+    <select id="engine">
+      <option value="webspeech">System voice</option>
+      <option value="piper">Piper (local server)</option>
+      <option value="kokoro">Kokoro (browser)</option>
+      <option value="edge">Edge Natural voices (best — needs Edge browser)</option>
+    </select>
+  </label>
+  <label>Voice <select id="voice"></select></label>
+  <label>Rate <input id="rate" type="range" min="0.5" max="2" step="0.05" value="1" style="width:120px"></label>
+  <span id="rateLabel">1.00x</span>
+  <span id="engineBadge">checking...</span>
+  <span id="status">Load a PDF to begin.</span>
+</div>
+<div id="viewer">
+  <div id="empty">
+    <h1>PDF Reader with Voice</h1>
+    <p>Pick a PDF above. Click <b>Play</b> to read it aloud, or click any word to start from there.</p>
+    <p style="font-size:13px;opacity:.6">For natural Piper voices, run <code>start.ps1</code> and open this page via <code>http://localhost:8910/</code>.</p>
+  </div>
+</div>
+<div id="help">Tip: click any word to start from there. Space = pause/resume. Esc = stop. Changing voice or rate restarts from the current word.</div>
+
+<script type="module">
+import * as pdfjsLib from "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.7.76/build/pdf.mjs";
+pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.7.76/build/pdf.worker.mjs";
+
+const fileEl = document.getElementById('file');
+const playBtn = document.getElementById('play');
+const pauseBtn = document.getElementById('pause');
+const stopBtn = document.getElementById('stop');
+const engineSel = document.getElementById('engine');
+const voiceSel = document.getElementById('voice');
+const rateEl = document.getElementById('rate');
+const rateLabel = document.getElementById('rateLabel');
+const statusEl = document.getElementById('status');
+const engineBadge = document.getElementById('engineBadge');
+const viewer = document.getElementById('viewer');
+
+// Prefer same-origin (when page is served by start.ps1), fall back to localhost:8910.
+const SERVER_BASE = (location.protocol === "http:" && location.port === "8910") ? "" : "http://localhost:8910";
+let piperAvailable = false;
+let piperVoices = [];
+
+// Kokoro (browser-side neural TTS via transformers.js)
+const KOKORO_VOICES = [
+  "af_heart","af_bella","af_nicole","af_sarah","af_sky","af_alloy","af_aoede","af_jessica","af_kore","af_river","af_nova",
+  "am_adam","am_michael","am_echo","am_eric","am_fenrir","am_liam","am_onyx","am_puck","am_santa",
+  "bf_alice","bf_emma","bf_isabella","bf_lily",
+  "bm_daniel","bm_fable","bm_george","bm_lewis"
+];
+let kokoroTts = null;
+let kokoroLoadPromise = null;
+
+// Microsoft Online (Natural) neural voices — Edge browser exposes them via the
+// standard Web Speech API. We just filter the system voice list.
+function getEdgeOnlineVoices() {
+  return speechSynthesis.getVoices().filter(v =>
+    /Online \(Natural\)|Natural\s*-/i.test(v.name) || /Microsoft .* Online/.test(v.name)
+  );
+}
+
+let allWords = [];   // {el, start, end}
+let fullText = "";
+let currentIdx = -1;
+let utterance = null;
+let suppressAutoScroll = false;
+
+// Piper playback state
+let piperAudio = null;
+let piperCancelled = false;
+let piperAnimId = null;
+
+function setStatus(s) { statusEl.textContent = s; }
+
+// ----- Detect Piper server -----
+async function detectPiper() {
+  try {
+    const r = await fetch(SERVER_BASE + "/voices", { method: "GET" });
+    if (!r.ok) throw new Error("voices not ok");
+    piperVoices = await r.json();
+    piperAvailable = piperVoices.length > 0;
+  } catch (e) {
+    piperAvailable = false;
+  }
+  if (piperAvailable) {
+    engineBadge.textContent = "Piper online";
+    engineBadge.classList.add("piper");
+    engineSel.value = "piper";
+  } else {
+    engineBadge.textContent = "system only";
+    engineSel.querySelector('option[value="piper"]').disabled = true;
+    engineSel.value = "webspeech";
+  }
+  refreshVoiceList();
+}
+
+// ----- System voice loading -----
+function loadSystemVoices() {
+  const voices = speechSynthesis.getVoices();
+  return voices.map((v, i) => ({ id: String(i), label: `${v.name} (${v.lang})${v.default ? ' *' : ''}`, _voice: v }));
+}
+
+function refreshVoiceList() {
+  const prev = voiceSel.value;
+  voiceSel.innerHTML = '';
+  if (engineSel.value === "piper") {
+    for (const name of piperVoices) {
+      const opt = document.createElement('option');
+      opt.value = name;
+      opt.textContent = name;
+      voiceSel.appendChild(opt);
+    }
+  } else if (engineSel.value === "kokoro") {
+    for (const name of KOKORO_VOICES) {
+      const opt = document.createElement('option');
+      opt.value = name;
+      opt.textContent = name;
+      voiceSel.appendChild(opt);
+    }
+    voiceSel.value = "af_heart";
+  } else if (engineSel.value === "edge") {
+    const list = getEdgeOnlineVoices();
+    if (list.length === 0) {
+      const opt = document.createElement('option');
+      opt.value = "";
+      opt.textContent = "(none found — use Microsoft Edge browser to access Natural voices)";
+      voiceSel.appendChild(opt);
+    } else {
+      const voices = speechSynthesis.getVoices();
+      for (const v of list) {
+        const opt = document.createElement('option');
+        opt.value = String(voices.indexOf(v));
+        opt.textContent = v.name.replace(/Microsoft\s+/, '').replace(/\s+-\s+English.*/, '');
+        voiceSel.appendChild(opt);
+      }
+    }
+  } else {
+    const list = loadSystemVoices();
+    for (const v of list) {
+      const opt = document.createElement('option');
+      opt.value = v.id;
+      opt.textContent = v.label;
+      voiceSel.appendChild(opt);
+    }
+    const voices = speechSynthesis.getVoices();
+    const enIdx = voices.findIndex(v => v.lang.toLowerCase().startsWith('en'));
+    if (enIdx >= 0) voiceSel.value = String(enIdx);
+  }
+  if (prev && [...voiceSel.options].some(o => o.value === prev)) voiceSel.value = prev;
+}
+speechSynthesis.onvoiceschanged = () => { if (engineSel.value !== "piper") refreshVoiceList(); };
+engineSel.addEventListener('change', () => {
+  stopSpeech();
+  refreshVoiceList();
+});
+
+rateEl.addEventListener('input', () => {
+  rateLabel.textContent = parseFloat(rateEl.value).toFixed(2) + 'x';
+});
+
+// ----- PDF loading -----
+fileEl.addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  stopSpeech();
+  setStatus('Loading PDF...');
+  viewer.innerHTML = '';
+  allWords = [];
+  fullText = '';
+  try {
+    const buf = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+    for (let p = 1; p <= pdf.numPages; p++) {
+      setStatus(`Rendering page ${p} / ${pdf.numPages}...`);
+      await renderPage(pdf, p);
+    }
+    setStatus(`Loaded ${pdf.numPages} page(s), ${allWords.length} words.`);
+    playBtn.disabled = allWords.length === 0;
+    stopBtn.disabled = false;
+  } catch (err) {
+    console.error(err);
+    setStatus('Failed to load: ' + err.message);
+  }
+});
+
+async function renderPage(pdf, num) {
+  const page = await pdf.getPage(num);
+  const scale = 1.5;
+  const viewport = page.getViewport({ scale });
+
+  const wrap = document.createElement('div');
+  wrap.className = 'page';
+  wrap.style.width = viewport.width + 'px';
+  wrap.style.height = viewport.height + 'px';
+
+  const canvas = document.createElement('canvas');
+  canvas.width = viewport.width;
+  canvas.height = viewport.height;
+  wrap.appendChild(canvas);
+
+  const layer = document.createElement('div');
+  layer.className = 'word-layer';
+  wrap.appendChild(layer);
+  viewer.appendChild(wrap);
+
+  await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+
+  const textContent = await page.getTextContent();
+  for (const item of textContent.items) {
+    if (!item.str) {
+      if (item.hasEOL) fullText += '\n';
+      continue;
+    }
+    if (!item.str.trim()) {
+      fullText += item.str;
+      if (item.hasEOL) fullText += '\n';
+      continue;
+    }
+    const tx = pdfjsLib.Util.transform(viewport.transform, item.transform);
+    const fontHeight = Math.hypot(tx[2], tx[3]);
+    const angle = Math.atan2(tx[1], tx[0]);
+    const x0 = tx[4];
+    const yBaseline = tx[5];
+    const totalWidth = item.width * scale;
+    const text = item.str;
+    const parts = text.split(/(\s+)/);
+    let charOffset = 0;
+    for (const part of parts) {
+      if (!part) continue;
+      if (/^\s+$/.test(part)) {
+        fullText += part;
+        charOffset += part.length;
+        continue;
+      }
+      const partWidth = (part.length / text.length) * totalWidth;
+      const wx = x0 + (charOffset / text.length) * totalWidth;
+      const word = document.createElement('span');
+      word.className = 'word';
+      word.textContent = part;
+      word.style.left = wx + 'px';
+      word.style.top = (yBaseline - fontHeight) + 'px';
+      word.style.height = fontHeight + 'px';
+      word.style.width = partWidth + 'px';
+      word.style.fontSize = fontHeight + 'px';
+      if (Math.abs(angle) > 0.001) word.style.transform = `rotate(${angle}rad)`;
+      layer.appendChild(word);
+      const idx = allWords.length;
+      const start = fullText.length;
+      fullText += part;
+      const end = fullText.length;
+      allWords.push({ el: word, start, end });
+      word.addEventListener('click', () => speakFromWord(idx));
+      charOffset += part.length;
+    }
+    if (item.hasEOL) fullText += '\n';
+  }
+}
+
+// ----- Highlight helpers -----
+function clearHighlights() {
+  for (const w of allWords) w.el.classList.remove('current', 'spoken');
+  currentIdx = -1;
+}
+
+function highlightWord(idx, markSpoken = true) {
+  if (idx === currentIdx) return;
+  if (currentIdx >= 0 && allWords[currentIdx]) {
+    allWords[currentIdx].el.classList.remove('current');
+    if (markSpoken) allWords[currentIdx].el.classList.add('spoken');
+  }
+  currentIdx = idx;
+  if (idx < 0 || idx >= allWords.length) return;
+  const el = allWords[idx].el;
+  el.classList.add('current');
+  el.classList.remove('spoken');
+  if (!suppressAutoScroll) {
+    const rect = el.getBoundingClientRect();
+    const vRect = viewer.getBoundingClientRect();
+    if (rect.top < vRect.top + 80 || rect.bottom > vRect.bottom - 80) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+  }
+}
+
+function highlightByChar(absCharIndex) {
+  for (let i = Math.max(0, currentIdx); i < allWords.length; i++) {
+    if (absCharIndex < allWords[i].end) { highlightWord(i); return; }
+  }
+  for (let i = 0; i < allWords.length; i++) {
+    if (absCharIndex < allWords[i].end) { highlightWord(i); return; }
+  }
+}
+
+// ----- Speech: Web Speech engine -----
+// Single-utterance approach: Edge's online (Natural) voices get rate-limit
+// errors when speak() is called repeatedly in quick succession (every chunk
+// is a separate Azure request). We hand the engine the entire remaining text
+// at once and let onboundary drive the highlight. Stop responsiveness is
+// handled by stopSpeech's pause+cancel dance — Edge keeps a few seconds of
+// buffered audio that we can't flush from JS, but the next sentence will not
+// start once cancelled.
+let webspeechCancelled = false;
+
+function webspeechFromWord(idx) {
+  const charStart = allWords[idx].start;
+  const PARA_MARK = '\u241E';
+  const text = fullText.slice(charStart)
+    .replace(/\n{2,}/g, PARA_MARK)
+    .replace(/\s*\n\s*/g, ' ')
+    .replace(/[\x00-\x1F\x7F]/g, ' ')
+    .replace(/[ \t]+/g, ' ')
+    .split(PARA_MARK).join('\n\n')
+    .trim();
+  if (!text) return;
+
+  for (let i = 0; i < allWords.length; i++) {
+    allWords[i].el.classList.remove('current');
+    if (i < idx) allWords[i].el.classList.add('spoken');
+    else allWords[i].el.classList.remove('spoken');
+  }
+  currentIdx = idx;
+  allWords[idx].el.classList.add('current');
+
+  webspeechCancelled = false;
+
+  const u = new SpeechSynthesisUtterance(text);
+  utterance = u;
+  const voices = speechSynthesis.getVoices();
+  const v = voices[parseInt(voiceSel.value)] || voices[0];
+  if (v) u.voice = v;
+  u.rate = parseFloat(rateEl.value);
+  u.onboundary = (e) => {
+    if (e.name && e.name !== 'word') return;
+    highlightByChar(charStart + e.charIndex);
+  };
+  u.onend = () => {
+    if (webspeechCancelled) return;
+    setStatus('Finished.');
+    if (currentIdx >= 0 && allWords[currentIdx]) allWords[currentIdx].el.classList.remove('current');
+    currentIdx = -1;
+    utterance = null;
+    pauseBtn.disabled = true;
+    playBtn.disabled = false;
+  };
+  u.onerror = (e) => {
+    if (e.error === 'interrupted' || e.error === 'canceled') return;
+    console.warn('TTS error:', e.error);
+    setStatus('TTS error: ' + e.error);
+    utterance = null;
+    pauseBtn.disabled = true;
+    playBtn.disabled = false;
+  };
+  setTimeout(() => {
+    if (webspeechCancelled) return;
+    speechSynthesis.speak(u);
+  }, 80);
+
+  playBtn.disabled = true;
+  pauseBtn.disabled = false;
+  pauseBtn.textContent = '⏸⏸ Pause';
+  setStatus('Reading (system voice)...');
+}
+
+// ----- Speech: Piper engine -----
+// Group consecutive words into chunks for synthesis. Kokoro degrades on long
+// chunks, so we split on commas/clauses when its splitMidSentence flag is set.
+function buildChunksFromWord(startIdx, opts) {
+  const maxWords         = (opts && opts.maxWords)         || 30;
+  const splitMidSentence = !!(opts && opts.splitMidSentence);
+  const clauseAfter      = (opts && opts.clauseAfter)      || 8;
+  const chunks = [];
+  let curWords = [];
+  let curText = "";
+  const flush = () => {
+    if (!curWords.length) return;
+    chunks.push({ words: curWords, text: curText.trim() });
+    curWords = []; curText = "";
+  };
+  for (let i = startIdx; i < allWords.length; i++) {
+    const w = allWords[i];
+    const wText = fullText.slice(w.start, w.end);
+    curWords.push(i);
+    curText += wText + " ";
+    const endsSentence = /[.!?]["')\]]?$/.test(wText);
+    const endsClause   = /[,;:–—]$/.test(wText);
+    if (endsSentence && curWords.length >= 3) flush();
+    else if (splitMidSentence && endsClause && curWords.length >= clauseAfter) flush();
+    else if (curWords.length >= maxWords) flush();
+  }
+  flush();
+  return chunks;
+}
+
+async function synthesizePiper(text, voice) {
+  const r = await fetch(SERVER_BASE + "/tts", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, voice })
+  });
+  if (!r.ok) throw new Error("Piper server error " + r.status);
+  return { blob: await r.blob() };
+}
+
+// ---- Kokoro (browser-side neural TTS) ----
+async function initKokoro() {
+  if (kokoroTts) return kokoroTts;
+  if (kokoroLoadPromise) return kokoroLoadPromise;
+  kokoroLoadPromise = (async () => {
+    setStatus('Kokoro: loading library...');
+    const mod = await import("https://esm.sh/kokoro-js@1.2.1");
+    const KokoroTTS = mod.KokoroTTS;
+    const useWebGPU = ('gpu' in navigator);
+    setStatus(`Kokoro: downloading model (~80 MB, first run only, ${useWebGPU ? 'WebGPU' : 'WASM CPU'})...`);
+    kokoroTts = await KokoroTTS.from_pretrained("onnx-community/Kokoro-82M-v1.0-ONNX", {
+      dtype: useWebGPU ? "fp32" : "q8",
+      device: useWebGPU ? "webgpu" : "wasm",
+      progress_callback: (p) => {
+        if (p && p.status === "progress" && p.total) {
+          const pct = Math.round((p.loaded / p.total) * 100);
+          setStatus(`Kokoro: downloading ${p.file || ''} ${pct}%`);
+        }
+      }
+    });
+    setStatus('Kokoro ready.');
+    return kokoroTts;
+  })();
+  try { return await kokoroLoadPromise; }
+  catch (e) { kokoroLoadPromise = null; throw e; }
+}
+
+async function synthesizeKokoro(text, voice) {
+  const tts = await initKokoro();
+  const audio = await tts.generate(text, { voice });
+  const blob = (typeof audio.toBlob === "function") ? audio.toBlob() : float32ToWavBlob(audio.audio, audio.sampling_rate);
+  return { blob };
+}
+
+// ---- Edge online neural TTS (Microsoft Read-Aloud endpoint) ----
+function escapeXml(s) {
+  return s.replace(/[<>&'"]/g, c => ({ '<':'&lt;', '>':'&gt;', '&':'&amp;', "'":'&apos;', '"':'&quot;' }[c]));
+}
+function uuidNoDashes() {
+  return crypto.randomUUID().replace(/-/g, '');
+}
+// Edge engine reuses Web Speech but with the natural voice already pre-selected.
+// (Microsoft's direct TTS endpoint does TLS fingerprinting and rejects every
+// non-browser client, including the Python edge-tts trick from PowerShell.)
+
+
+function float32ToWavBlob(samples, sampleRate) {
+  const numChannels = 1, bytesPerSample = 2;
+  const buf = new ArrayBuffer(44 + samples.length * bytesPerSample);
+  const v = new DataView(buf);
+  let o = 0;
+  const ws = (s) => { for (let i = 0; i < s.length; i++) v.setUint8(o++, s.charCodeAt(i)); };
+  const wu32 = (n) => { v.setUint32(o, n, true); o += 4; };
+  const wu16 = (n) => { v.setUint16(o, n, true); o += 2; };
+  ws('RIFF'); wu32(36 + samples.length * bytesPerSample); ws('WAVE');
+  ws('fmt '); wu32(16); wu16(1); wu16(numChannels); wu32(sampleRate);
+  wu32(sampleRate * numChannels * bytesPerSample); wu16(numChannels * bytesPerSample); wu16(bytesPerSample * 8);
+  ws('data'); wu32(samples.length * bytesPerSample);
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    v.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7FFF, true); o += 2;
+  }
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
+function playChunkWithHighlight(audio, words, boundaries) {
+  return new Promise((resolve, reject) => {
+    const useBoundaries = boundaries && boundaries.length > 0;
+    let totalChars = 0;
+    for (const wIdx of words) totalChars += (allWords[wIdx].end - allWords[wIdx].start) + 1;
+    let bi = 0;
+
+    const tick = () => {
+      if (piperCancelled) { resolve(); return; }
+      if (audio.ended) { resolve(); return; }
+      if (audio.paused) { piperAnimId = requestAnimationFrame(tick); return; }
+      if (useBoundaries) {
+        const elapsedMs = audio.currentTime * 1000;
+        while (bi < boundaries.length && boundaries[bi].offsetMs <= elapsedMs) {
+          const wordIdx = words[Math.min(bi, words.length - 1)];
+          if (wordIdx !== currentIdx) highlightWord(wordIdx);
+          bi++;
+        }
+      } else {
+        const frac = audio.duration > 0 ? Math.min(1, audio.currentTime / audio.duration) : 0;
+        const targetChars = frac * totalChars;
+        let cum = 0;
+        let target = words[words.length - 1];
+        for (const wIdx of words) {
+          cum += (allWords[wIdx].end - allWords[wIdx].start) + 1;
+          if (cum > targetChars) { target = wIdx; break; }
+        }
+        if (target !== currentIdx) highlightWord(target);
+      }
+      piperAnimId = requestAnimationFrame(tick);
+    };
+
+    audio.addEventListener('ended', () => resolve(), { once: true });
+    audio.addEventListener('error', (e) => reject(e), { once: true });
+    audio.play().then(() => {
+      for (const wIdx of words) { allWords[wIdx].el.classList.remove('spoken'); }
+      highlightWord(words[0]);
+      piperAnimId = requestAnimationFrame(tick);
+    }).catch(reject);
+  });
+}
+
+async function streamSpeak(startIdx, synthFn, label, chunkOpts) {
+  piperCancelled = false;
+  for (let i = 0; i < allWords.length; i++) {
+    allWords[i].el.classList.remove('current');
+    if (i < startIdx) allWords[i].el.classList.add('spoken');
+    else allWords[i].el.classList.remove('spoken');
+  }
+  currentIdx = startIdx;
+  allWords[startIdx].el.classList.add('current');
+  playBtn.disabled = true;
+  pauseBtn.disabled = false;
+  pauseBtn.textContent = '⏸⏸ Pause';
+  setStatus(`${label}: synthesizing...`);
+
+  const chunks = buildChunksFromWord(startIdx, chunkOpts);
+  if (!chunks.length) return;
+  const rate = parseFloat(rateEl.value);
+
+  let nextPromise = synthFn(chunks[0].text);
+  for (let i = 0; i < chunks.length; i++) {
+    if (piperCancelled) break;
+    let result;
+    try { result = await nextPromise; }
+    catch (e) {
+      console.error(`${label} synth failed:`, e);
+      setStatus(`${label} error: ${e.message} (see DevTools console)`);
+      playBtn.disabled = false;
+      pauseBtn.disabled = true;
+      break;
+    }
+    if (i + 1 < chunks.length) {
+      nextPromise = synthFn(chunks[i+1].text).catch(e => { console.error(e); throw e; });
+    }
+    if (piperCancelled) break;
+    const url = URL.createObjectURL(result.blob);
+    piperAudio = new Audio(url);
+    piperAudio.playbackRate = rate;
+    setStatus(`${label}: playing ${i+1}/${chunks.length}`);
+    try { await playChunkWithHighlight(piperAudio, chunks[i].words, result.boundaries); }
+    catch (e) { console.error(e); }
+    URL.revokeObjectURL(url);
+    piperAudio = null;
+  }
+  if (!piperCancelled) {
+    setStatus('Finished.');
+    if (currentIdx >= 0 && allWords[currentIdx]) allWords[currentIdx].el.classList.remove('current');
+    currentIdx = -1;
+  }
+  playBtn.disabled = false;
+  pauseBtn.disabled = true;
+}
+
+function piperFromWord(startIdx) {
+  const voice = voiceSel.value || (piperVoices[0] || "en_US-lessac-medium");
+  return streamSpeak(startIdx, (text) => synthesizePiper(text, voice), "Piper");
+}
+
+function kokoroFromWord(startIdx) {
+  const voice = voiceSel.value || "af_heart";
+  return streamSpeak(startIdx, (text) => synthesizeKokoro(text, voice), "Kokoro",
+    { maxWords: 18, splitMidSentence: true, clauseAfter: 6 });
+}
+
+function edgeFromWord(startIdx) {
+  // Just use Web Speech with the currently-selected natural voice
+  webspeechFromWord(startIdx);
+}
+
+// ----- Unified controls -----
+function speakFromWord(idx) {
+  if (idx < 0 || idx >= allWords.length) return;
+  stopSpeech();
+  if (engineSel.value === "edge") edgeFromWord(idx);
+  else if (engineSel.value === "kokoro") kokoroFromWord(idx);
+  else if (engineSel.value === "piper" && piperAvailable) piperFromWord(idx);
+  else webspeechFromWord(idx);
+}
+
+function stopSpeech() {
+  // Web Speech: set the cancel flag so the chunked queue can't re-arm itself,
+  // detach handlers on the live utterance, then do the pause+cancel dance Edge
+  // online (Natural) voices need to flush their pre-buffered audio.
+  webspeechCancelled = true;
+  if (utterance) {
+    utterance.onend = null;
+    utterance.onerror = null;
+    utterance.onboundary = null;
+  }
+  utterance = null;
+  try { speechSynthesis.pause(); } catch(e){}
+  try { speechSynthesis.cancel(); } catch(e){}
+  try { speechSynthesis.resume(); } catch(e){}
+  try { speechSynthesis.cancel(); } catch(e){}
+  // Piper / Kokoro audio path
+  piperCancelled = true;
+  if (piperAnimId) cancelAnimationFrame(piperAnimId);
+  piperAnimId = null;
+  if (piperAudio) { try { piperAudio.pause(); } catch(e){} piperAudio = null; }
+  clearHighlights();
+  pauseBtn.disabled = true;
+  pauseBtn.textContent = '⏸⏸ Pause';
+  playBtn.disabled = allWords.length === 0;
+}
+
+playBtn.addEventListener('click', () => {
+  if (engineSel.value === "webspeech" && speechSynthesis.paused) {
+    speechSynthesis.resume();
+    playBtn.disabled = true;
+    pauseBtn.disabled = false;
+    pauseBtn.textContent = '⏸⏸ Pause';
+    setStatus('Reading...');
+    return;
+  }
+  if (engineSel.value !== "webspeech" && piperAudio && piperAudio.paused) {
+    piperAudio.play();
+    playBtn.disabled = true;
+    pauseBtn.disabled = false;
+    pauseBtn.textContent = '⏸⏸ Pause';
+    setStatus('Reading...');
+    return;
+  }
+  const startIdx = currentIdx >= 0 ? currentIdx : 0;
+  speakFromWord(startIdx);
+});
+
+pauseBtn.addEventListener('click', () => {
+  if (engineSel.value === "webspeech") {
+    if (speechSynthesis.paused) {
+      speechSynthesis.resume();
+      pauseBtn.textContent = '⏸⏸ Pause';
+      playBtn.disabled = true;
+      setStatus('Reading...');
+    } else {
+      speechSynthesis.pause();
+      pauseBtn.textContent = '▶ Resume';
+      playBtn.disabled = false;
+      setStatus('Paused.');
+    }
+  } else if (piperAudio) {
+    if (piperAudio.paused) {
+      piperAudio.play();
+      pauseBtn.textContent = '⏸⏸ Pause';
+      playBtn.disabled = true;
+      setStatus('Reading...');
+    } else {
+      piperAudio.pause();
+      pauseBtn.textContent = '▶ Resume';
+      playBtn.disabled = false;
+      setStatus('Paused.');
+    }
+  }
+});
+
+stopBtn.addEventListener('click', stopSpeech);
+
+rateEl.addEventListener('change', () => {
+  if (engineSel.value === "webspeech") {
+    if (speechSynthesis.speaking && currentIdx >= 0) speakFromWord(currentIdx);
+  } else if (piperAudio) {
+    piperAudio.playbackRate = parseFloat(rateEl.value);
+  }
+});
+voiceSel.addEventListener('change', () => {
+  if (currentIdx >= 0 && (speechSynthesis.speaking || piperAudio)) speakFromWord(currentIdx);
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+  if (e.code === 'Space') { e.preventDefault(); pauseBtn.click(); }
+  else if (e.key === 'Escape') { stopBtn.click(); }
+});
+
+let scrollTimer;
+viewer.addEventListener('wheel', () => {
+  suppressAutoScroll = true;
+  clearTimeout(scrollTimer);
+  scrollTimer = setTimeout(() => { suppressAutoScroll = false; }, 3000);
+}, { passive: true });
+
+// Boot
+detectPiper();
+</script>
+</body>
+</html>

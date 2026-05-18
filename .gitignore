@@ -1,0 +1,14 @@
+# Downloaded by start.ps1 on first run — too big for git, fetched fresh per machine
+piper/
+voices/
+
+# Editor / OS junk
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# Local notes & scratch
+_fix.js
+*.log
